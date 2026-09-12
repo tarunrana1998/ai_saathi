@@ -4,26 +4,38 @@ import {
     Bot,
     Check,
     ChevronRight,
+    Clock,
     Code2,
     Copy,
     Cpu,
+    FileCode,
+    FileText,
     Gauge,
+    Image as ImageIcon,
     Layers,
     Menu,
     Orbit,
+    Paperclip,
     Plus,
     Radio,
+    RefreshCw,
     Send,
     Shield,
     Sparkles,
     Terminal,
+    Timer,
     Trash2,
+    UploadCloud,
     User,
     Wifi,
     X,
     Zap,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import ReactMarkdown from 'react-markdown';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import remarkGfm from 'remark-gfm';
 
 interface TokenUsage {
     prompt_tokens?: number;
@@ -32,10 +44,42 @@ interface TokenUsage {
     reasoning_tokens?: number;
 }
 
+interface QuotaStats {
+    limit: number;
+    used: number;
+    remaining: number;
+    percentage: number;
+    rpm_limit?: number;
+    rpm_used?: number;
+    rpm_remaining?: number;
+    rpd_limit?: number;
+    rpd_used?: number;
+    rpd_remaining?: number;
+    reset_in_seconds: number;
+    window_seconds: number;
+}
+
+interface MessageAttachment {
+    name?: string;
+    url?: string;
+    mime_type?: string;
+    size?: string | number;
+    is_image?: boolean;
+}
+
+interface FileAttachment {
+    file: File;
+    previewUrl?: string;
+    isImage: boolean;
+    name: string;
+    sizeFormatted: string;
+}
+
 interface Message {
     id: string;
     role: 'user' | 'assistant';
     content: string;
+    attachments?: MessageAttachment[] | null;
     usage?: TokenUsage | null;
     created_at?: string;
 }
@@ -47,17 +91,92 @@ interface Conversation {
     updated_at?: string;
 }
 
+function formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function CodeBlock({ language, value }: { language: string; value: string }) {
+    const [copied, setCopied] = useState(false);
+
+    const onCopy = () => {
+        void navigator.clipboard.writeText(value);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+    };
+
+    return (
+        <div className="relative my-3.5 rounded-xl border border-cyan-900/60 bg-[#080d19] overflow-hidden shadow-2xl">
+            {/* Code Block HUD Header */}
+            <div className="flex items-center justify-between border-b border-cyan-950/90 bg-[#060913] px-3.5 py-1.5 font-mono text-[11px] text-cyan-400">
+                <div className="flex items-center gap-2">
+                    <div className="flex gap-1">
+                        <span className="size-2 rounded-full bg-red-500/80" />
+                        <span className="size-2 rounded-full bg-yellow-500/80" />
+                        <span className="size-2 rounded-full bg-emerald-500/80" />
+                    </div>
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-cyan-300 ml-1">
+                        {language || 'code'}
+                    </span>
+                </div>
+                <button
+                    type="button"
+                    onClick={onCopy}
+                    className="flex items-center gap-1 rounded-md px-2 py-0.5 text-[10px] text-neutral-400 hover:bg-cyan-950/70 hover:text-cyan-300 transition-colors border border-transparent hover:border-cyan-800/40"
+                >
+                    {copied ? (
+                        <>
+                            <Check className="size-3 text-emerald-400" />
+                            <span className="text-emerald-400 font-semibold">COPIED</span>
+                        </>
+                    ) : (
+                        <>
+                            <Copy className="size-3" />
+                            <span>COPY CODE</span>
+                        </>
+                    )}
+                </button>
+            </div>
+
+            {/* Syntax Highlighted Code Body */}
+            <div className="overflow-x-auto text-[13px] font-mono leading-relaxed p-1">
+                <SyntaxHighlighter
+                    language={language || 'javascript'}
+                    style={vscDarkPlus}
+                    customStyle={{
+                        margin: 0,
+                        padding: '1rem',
+                        background: 'transparent',
+                        fontSize: '13px',
+                        lineHeight: '1.6',
+                    }}
+                    wrapLongLines={true}
+                >
+                    {value}
+                </SyntaxHighlighter>
+            </div>
+        </div>
+    );
+}
+
 export default function Welcome() {
     const [conversations, setConversations] = useState<Conversation[]>([]);
     const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
     const [messages, setMessages] = useState<Message[]>([]);
     const [input, setInput] = useState('');
+    const [attachments, setAttachments] = useState<FileAttachment[]>([]);
     const [isLoading, setIsLoading] = useState(false);
     const [sidebarOpen, setSidebarOpen] = useState(false);
     const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
 
+    // Live Quota & Countdown State
+    const [quota, setQuota] = useState<QuotaStats | null>(null);
+    const [countdownSeconds, setCountdownSeconds] = useState<number>(60);
+
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
+    const fileInputRef = useRef<HTMLInputElement>(null);
 
     // Calculate total conversation tokens
     const totalSessionTokens = useMemo(() => {
@@ -78,6 +197,37 @@ export default function Welcome() {
         scrollToBottom();
     }, [messages, isLoading]);
 
+    // Fetch quota from backend
+    const fetchQuota = async () => {
+        try {
+            const res = await fetch('/api/quota');
+            if (res.ok) {
+                const data: QuotaStats = await res.json();
+                setQuota(data);
+                setCountdownSeconds(data.reset_in_seconds);
+            }
+        } catch (e) {
+            console.error('Failed to fetch quota metrics', e);
+        }
+    };
+
+    // Countdown Timer Ticker
+    useEffect(() => {
+        void fetchQuota();
+
+        const timer = setInterval(() => {
+            setCountdownSeconds((prev) => {
+                if (prev <= 1) {
+                    void fetchQuota();
+                    return 60;
+                }
+                return prev - 1;
+            });
+        }, 1000);
+
+        return () => clearInterval(timer);
+    }, []);
+
     // Fetch conversation logs
     const fetchConversations = async () => {
         try {
@@ -94,6 +244,33 @@ export default function Welcome() {
     useEffect(() => {
         void fetchConversations();
     }, []);
+
+    // File Selection Handlers
+    const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+        if (!e.target.files || e.target.files.length === 0) return;
+        const newFiles: FileAttachment[] = Array.from(e.target.files).map((f) => {
+            const isImage = f.type.startsWith('image/');
+            return {
+                file: f,
+                previewUrl: isImage ? URL.createObjectURL(f) : undefined,
+                isImage,
+                name: f.name,
+                sizeFormatted: formatBytes(f.size),
+            };
+        });
+        setAttachments((prev) => [...prev, ...newFiles]);
+        if (fileInputRef.current) fileInputRef.current.value = '';
+    };
+
+    const handleRemoveAttachment = (index: number) => {
+        setAttachments((prev) => {
+            const removed = prev[index];
+            if (removed?.previewUrl) {
+                URL.revokeObjectURL(removed.previewUrl);
+            }
+            return prev.filter((_, i) => i !== index);
+        });
+    };
 
     // Select conversation
     const selectConversation = async (id: string) => {
@@ -118,6 +295,7 @@ export default function Welcome() {
         setActiveConversationId(null);
         setMessages([]);
         setInput('');
+        setAttachments([]);
         setSidebarOpen(false);
         textareaRef.current?.focus();
     };
@@ -142,37 +320,51 @@ export default function Welcome() {
     const handleSubmit = async (e?: FormEvent) => {
         if (e) e.preventDefault();
         const trimmed = input.trim();
-        if (!trimmed || isLoading) return;
+        if ((!trimmed && attachments.length === 0) || isLoading) return;
 
+        const currentAttachments = [...attachments];
         const userMsg: Message = {
             id: `temp-${Date.now()}`,
             role: 'user',
-            content: trimmed,
+            content: trimmed || (currentAttachments.length > 0 ? `[Attached ${currentAttachments.length} file(s)]` : ''),
+            attachments: currentAttachments.map((a) => ({
+                name: a.name,
+                url: a.previewUrl,
+                is_image: a.isImage,
+                size: a.sizeFormatted,
+            })),
             created_at: new Date().toISOString(),
         };
 
         setMessages((prev) => [...prev, userMsg]);
         setInput('');
+        setAttachments([]);
         setIsLoading(true);
 
         try {
+            const formData = new FormData();
+            formData.append('message', trimmed || 'Please analyze and inspect the attached file(s).');
+            if (activeConversationId) {
+                formData.append('conversation_id', activeConversationId);
+            }
+            currentAttachments.forEach((a) => {
+                formData.append('files[]', a.file);
+            });
+
             const res = await fetch('/api/chat', {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json',
                     Accept: 'application/json',
                 },
-                body: JSON.stringify({
-                    message: trimmed,
-                    conversation_id: activeConversationId,
-                }),
+                body: formData,
             });
 
-            if (!res.ok) {
-                throw new Error(`Neural link status ${res.status}`);
-            }
-
             const data = await res.json();
+
+            if (!res.ok) {
+                const errorDetail = data.error || data.message || `Neural link status ${res.status}`;
+                throw new Error(errorDetail);
+            }
 
             if (!activeConversationId && data.conversation_id) {
                 setActiveConversationId(data.conversation_id);
@@ -180,6 +372,12 @@ export default function Welcome() {
 
             if (data.message) {
                 setMessages((prev) => [...prev, data.message]);
+            }
+
+            // Sync quota from response
+            if (data.quota) {
+                setQuota(data.quota);
+                setCountdownSeconds(data.quota.reset_in_seconds);
             }
 
             void fetchConversations();
@@ -200,6 +398,13 @@ export default function Welcome() {
         void navigator.clipboard.writeText(text);
         setCopiedIndex(index);
         setTimeout(() => setCopiedIndex(null), 2000);
+    };
+
+    const formatCountdown = (secs: number) => {
+        const s = Math.max(0, secs);
+        const mins = Math.floor(s / 60);
+        const remSecs = s % 60;
+        return `${mins.toString().padStart(2, '0')}:${remSecs.toString().padStart(2, '0')}s`;
     };
 
     const roboticProtocols = [
@@ -351,24 +556,61 @@ export default function Welcome() {
                         )}
                     </div>
 
-                    {/* Sidebar Telemetry & Token Stats Footer */}
-                    <div className="border-t border-cyan-900/40 p-4 bg-[#0a0e1a]/90 font-mono text-[11px] space-y-2.5">
-                        {/* Token Consumption Telemetry Meter */}
-                        <div className="rounded-xl border border-cyan-900/50 bg-cyan-950/30 p-2.5 space-y-1.5">
+                    {/* Sidebar Telemetry, Live Quota & Token Meter */}
+                    <div className="border-t border-cyan-900/40 p-4 bg-[#0a0e1a]/95 font-mono text-[11px] space-y-3">
+                        {/* Live Quota Remaining Card */}
+                        <div className="rounded-xl border border-cyan-800/50 bg-cyan-950/40 p-3 space-y-2.5">
                             <div className="flex items-center justify-between text-neutral-400 text-[10px]">
-                                <span className="flex items-center gap-1.5 text-cyan-400 font-semibold">
-                                    <Zap className="size-3" /> TOKEN MONITOR
+                                <span className="flex items-center gap-1.5 text-cyan-400 font-bold tracking-wider">
+                                    <Zap className="size-3 text-cyan-300" /> QUOTA TELEMETRY
                                 </span>
-                                <span className="font-bold text-cyan-300">{totalSessionTokens.toLocaleString()} TOTAL</span>
+                                <span className="font-bold text-emerald-400">
+                                    {quota ? `${(quota.remaining / 1000).toFixed(1)}K TPM` : '250K TPM'}
+                                </span>
                             </div>
-                            <div className="w-full bg-cyan-950/80 rounded-full h-1.5 overflow-hidden border border-cyan-800/40">
+
+                            {/* Triple Metrics Breakdown: RPM, TPM, RPD */}
+                            <div className="grid grid-cols-3 gap-1.5 pt-1 text-[10px]">
+                                <div className="rounded-lg bg-black/40 p-1.5 border border-cyan-900/40 text-center">
+                                    <div className="text-neutral-500 text-[9px]">RPM</div>
+                                    <div className="font-bold text-cyan-300">
+                                        {quota?.rpm_used ?? 0} / {quota?.rpm_limit ?? 5}
+                                    </div>
+                                </div>
+                                <div className="rounded-lg bg-black/40 p-1.5 border border-cyan-900/40 text-center">
+                                    <div className="text-neutral-500 text-[9px]">TPM</div>
+                                    <div className="font-bold text-emerald-400">
+                                        {quota ? `${(quota.used / 1000).toFixed(1)}K` : '0K'}
+                                    </div>
+                                </div>
+                                <div className="rounded-lg bg-black/40 p-1.5 border border-cyan-900/40 text-center">
+                                    <div className="text-neutral-500 text-[9px]">RPD</div>
+                                    <div className="font-bold text-amber-400">
+                                        {quota?.rpd_used ?? 0} / {quota?.rpd_limit ?? 20}
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Remaining Percentage Bar */}
+                            <div className="w-full bg-[#070b14] rounded-full h-1.5 overflow-hidden border border-cyan-900/60">
                                 <div
-                                    className="bg-gradient-to-r from-cyan-500 to-emerald-400 h-full rounded-full transition-all duration-500"
-                                    style={{ width: `${Math.min(100, Math.max(5, (totalSessionTokens / 2000) * 100))}%` }}
+                                    className="bg-gradient-to-r from-emerald-500 via-cyan-400 to-blue-500 h-full rounded-full transition-all duration-500"
+                                    style={{ width: `${quota?.percentage ?? 100}%` }}
                                 />
+                            </div>
+
+                            {/* Reset Countdown Readout */}
+                            <div className="flex items-center justify-between pt-1 border-t border-cyan-900/30 text-[10px] text-neutral-400">
+                                <span className="flex items-center gap-1">
+                                    <Timer className="size-3 text-cyan-400" /> RESETS IN:
+                                </span>
+                                <span className="font-bold text-cyan-300 tracking-wider">
+                                    {formatCountdown(countdownSeconds)}
+                                </span>
                             </div>
                         </div>
 
+                        {/* Model & Network Info */}
                         <div className="flex items-center justify-between text-neutral-400 text-[10px]">
                             <span className="flex items-center gap-1.5">
                                 <Cpu className="size-3 text-cyan-400" />
@@ -387,7 +629,7 @@ export default function Welcome() {
 
                 {/* Main Robotic Cockpit View */}
                 <main className="relative z-10 flex flex-1 flex-col h-full overflow-hidden bg-transparent">
-                    {/* Top Cyber Telemetry Header */}
+                    {/* Top Cyber Telemetry Header with Live Token Remaining & Countdown */}
                     <header className="flex h-16 shrink-0 items-center justify-between border-b border-cyan-900/40 bg-[#0c101c]/80 px-4 md:px-6 backdrop-blur-lg">
                         <div className="flex items-center gap-3">
                             <button
@@ -417,21 +659,50 @@ export default function Welcome() {
                             </div>
                         </div>
 
-                        <div className="flex items-center gap-2">
-                            {/* Live Session Token Badge in Header */}
-                            <div className="hidden sm:flex items-center gap-2 rounded-xl border border-cyan-900/50 bg-[#0f172a]/80 px-3 py-1.5 font-mono text-xs text-neutral-300">
-                                <Gauge className="size-3.5 text-cyan-400" />
-                                <span className="text-neutral-400 text-[10px]">SESSION TOKENS:</span>
-                                <span className="text-cyan-300 font-bold">{totalSessionTokens.toLocaleString()}</span>
+                        {/* Top Telemetry Meters: RPM, TPM, RPD & Reset Timer */}
+                        <div className="flex items-center gap-2 font-mono text-xs">
+                            {/* RPM Gauge */}
+                            <div className="hidden lg:flex items-center gap-1.5 rounded-xl border border-cyan-900/60 bg-[#0f172a]/80 px-2.5 py-1.5 text-neutral-300">
+                                <Activity className="size-3 text-cyan-400" />
+                                <span className="text-neutral-500 text-[10px]">RPM:</span>
+                                <span className="text-cyan-300 font-bold">
+                                    {quota?.rpm_used ?? 0}/{quota?.rpm_limit ?? 5}
+                                </span>
+                            </div>
+
+                            {/* TPM Gauge */}
+                            <div className="hidden sm:flex items-center gap-1.5 rounded-xl border border-cyan-900/60 bg-[#0f172a]/80 px-2.5 py-1.5 text-neutral-300">
+                                <Gauge className="size-3.5 text-emerald-400" />
+                                <span className="text-neutral-500 text-[10px]">TPM:</span>
+                                <span className="text-emerald-400 font-bold">
+                                    {quota ? `${(quota.remaining / 1000).toFixed(0)}K` : '250K'} REM
+                                </span>
+                            </div>
+
+                            {/* RPD Gauge */}
+                            <div className="hidden md:flex items-center gap-1.5 rounded-xl border border-cyan-900/60 bg-[#0f172a]/80 px-2.5 py-1.5 text-neutral-300">
+                                <span className="text-neutral-500 text-[10px]">RPD:</span>
+                                <span className="text-amber-400 font-bold">
+                                    {quota?.rpd_used ?? 0}/{quota?.rpd_limit ?? 20}
+                                </span>
+                            </div>
+
+                            {/* Reset Countdown Meter */}
+                            <div className="flex items-center gap-1.5 rounded-xl border border-cyan-900/60 bg-[#0f172a]/80 px-2.5 py-1.5 text-neutral-300">
+                                <Clock className="size-3 text-cyan-400 animate-spin [animation-duration:15s]" />
+                                <span className="text-neutral-500 text-[10px] hidden sm:inline">RESET:</span>
+                                <span className="text-cyan-300 font-bold tracking-wider">
+                                    {formatCountdown(countdownSeconds)}
+                                </span>
                             </div>
 
                             <button
                                 type="button"
                                 onClick={handleNewChat}
-                                className="flex items-center gap-1.5 rounded-xl border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 font-mono text-xs font-medium text-cyan-300 hover:bg-cyan-500/20 hover:border-cyan-400 transition-all shadow-sm shadow-cyan-500/10"
+                                className="flex items-center gap-1.5 rounded-xl border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-300 hover:bg-cyan-500/20 hover:border-cyan-400 transition-all shadow-sm shadow-cyan-500/10"
                             >
                                 <Plus className="size-3.5" />
-                                <span className="hidden sm:inline uppercase">NEW SESSION</span>
+                                <span className="hidden sm:inline uppercase">NEW</span>
                             </button>
                         </div>
                     </header>
@@ -505,7 +776,7 @@ export default function Welcome() {
                                     </div>
                                 </div>
                             ) : (
-                                /* Holographic Robotic Message Stream */
+                                /* Holographic Robotic Message Stream with Full Syntax-Highlighted Markdown */
                                 messages.map((msg, idx) => {
                                     const isUser = msg.role === 'user';
                                     const promptTokens = msg.usage?.prompt_tokens ?? 0;
@@ -542,8 +813,79 @@ export default function Welcome() {
                                                     )}
                                                 </div>
 
-                                                <div className="whitespace-pre-wrap font-sans text-[13.5px] leading-relaxed">
-                                                    {msg.content}
+                                                {/* User Attachments if any */}
+                                                {isUser && msg.attachments && msg.attachments.length > 0 && (
+                                                    <div className="mb-2.5 flex flex-wrap gap-2">
+                                                        {msg.attachments.map((att, aIdx) =>
+                                                            att.is_image && att.url ? (
+                                                                <div key={aIdx} className="overflow-hidden rounded-lg border border-cyan-400/40 bg-black/40 shadow">
+                                                                    <img src={att.url} alt={att.name || 'Attachment'} className="max-h-48 max-w-xs object-cover rounded" />
+                                                                    {att.name && <div className="p-1 font-mono text-[9px] text-cyan-200 truncate max-w-xs">{att.name}</div>}
+                                                                </div>
+                                                            ) : (
+                                                                <div key={aIdx} className="flex items-center gap-1.5 rounded-lg border border-cyan-400/40 bg-black/40 px-2.5 py-1.5 font-mono text-[11px] text-cyan-200">
+                                                                    <FileText className="size-3.5 text-cyan-300" />
+                                                                    <span className="truncate max-w-[180px]">{att.name || 'Attached File'}</span>
+                                                                    {att.size && <span className="text-[9px] text-white/50">({String(att.size)})</span>}
+                                                                </div>
+                                                            ),
+                                                        )}
+                                                    </div>
+                                                )}
+
+                                                {/* Formatted Markdown Content with Syntax Highlighting */}
+                                                <div className="font-sans text-[13.5px] leading-relaxed">
+                                                    {isUser ? (
+                                                        <div className="whitespace-pre-wrap">{msg.content}</div>
+                                                    ) : (
+                                                        <ReactMarkdown
+                                                            remarkPlugins={[remarkGfm]}
+                                                            components={{
+                                                                h1: ({ children }) => <h1 className="text-lg font-bold text-white mb-2 mt-3">{children}</h1>,
+                                                                h2: ({ children }) => <h2 className="text-base font-bold text-cyan-200 mb-2 mt-2.5">{children}</h2>,
+                                                                h3: ({ children }) => <h3 className="text-sm font-semibold text-cyan-300 mb-1 mt-2">{children}</h3>,
+                                                                p: ({ children }) => <p className="mb-2.5 leading-relaxed text-neutral-200 last:mb-0">{children}</p>,
+                                                                ul: ({ children }) => <ul className="list-disc list-inside mb-2.5 space-y-1 text-neutral-200">{children}</ul>,
+                                                                ol: ({ children }) => <ol className="list-decimal list-inside mb-2.5 space-y-1 text-neutral-200">{children}</ol>,
+                                                                li: ({ children }) => <li className="text-neutral-200">{children}</li>,
+                                                                blockquote: ({ children }) => <blockquote className="border-l-2 border-cyan-400 pl-3 italic text-neutral-400 my-2">{children}</blockquote>,
+                                                                code({ className, children, ...props }) {
+                                                                    const match = /language-(\w+)/.exec(className || '');
+                                                                    const codeString = String(children).replace(/\n$/, '');
+                                                                    const isInline = !match && !String(children).includes('\n');
+
+                                                                    if (isInline) {
+                                                                        return (
+                                                                            <code className="rounded-md bg-cyan-950/80 border border-cyan-800/50 px-1.5 py-0.5 font-mono text-[12px] text-cyan-300" {...props}>
+                                                                                {children}
+                                                                            </code>
+                                                                        );
+                                                                    }
+
+                                                                    return (
+                                                                        <CodeBlock
+                                                                            language={match ? match[1] : ''}
+                                                                            value={codeString}
+                                                                        />
+                                                                    );
+                                                                },
+                                                                table: ({ children }) => (
+                                                                    <div className="my-3 overflow-x-auto rounded-lg border border-cyan-900/50">
+                                                                        <table className="w-full text-left text-xs">{children}</table>
+                                                                    </div>
+                                                                ),
+                                                                th: ({ children }) => <th className="border-b border-cyan-900/60 bg-cyan-950/60 p-2 font-mono font-semibold text-cyan-300">{children}</th>,
+                                                                td: ({ children }) => <td className="border-b border-cyan-900/30 p-2 text-neutral-300">{children}</td>,
+                                                                a: ({ href, children }) => (
+                                                                    <a href={href} target="_blank" rel="noopener noreferrer" className="text-cyan-400 hover:text-cyan-300 underline underline-offset-2">
+                                                                        {children}
+                                                                    </a>
+                                                                ),
+                                                            }}
+                                                        >
+                                                            {msg.content}
+                                                        </ReactMarkdown>
+                                                    )}
                                                 </div>
 
                                                 {/* Assistant Footer with Real-Time Token Telemetry */}
@@ -618,10 +960,62 @@ export default function Welcome() {
                     {/* Bottom Futuristic Command Console */}
                     <div className="shrink-0 border-t border-cyan-900/40 bg-[#090d18]/90 p-4 backdrop-blur-xl">
                         <div className="mx-auto max-w-4xl space-y-2">
+                            {/* Staged Attachments Preview Dock */}
+                            {attachments.length > 0 && (
+                                <div className="flex flex-wrap items-center gap-2 rounded-xl border border-cyan-900/60 bg-[#0c1222]/90 p-2.5 backdrop-blur-md">
+                                    <div className="flex items-center gap-1.5 font-mono text-[10px] text-cyan-400 mr-1">
+                                        <UploadCloud className="size-3.5 text-cyan-400" />
+                                        <span>STAGED PAYLOADS ({attachments.length}):</span>
+                                    </div>
+                                    {attachments.map((att, idx) => (
+                                        <div
+                                            key={idx}
+                                            className="group relative flex items-center gap-2 rounded-lg border border-cyan-700/50 bg-cyan-950/70 py-1 pl-2 pr-1.5 text-xs font-mono text-cyan-200 shadow"
+                                        >
+                                            {att.isImage && att.previewUrl ? (
+                                                <img src={att.previewUrl} alt={att.name} className="size-5 rounded object-cover border border-cyan-500/40" />
+                                            ) : (
+                                                <FileCode className="size-4 text-cyan-400" />
+                                            )}
+                                            <span className="max-w-[140px] truncate text-[11px] font-medium">{att.name}</span>
+                                            <span className="text-[9px] text-cyan-400/60">({att.sizeFormatted})</span>
+                                            <button
+                                                type="button"
+                                                onClick={() => handleRemoveAttachment(idx)}
+                                                className="rounded p-0.5 text-cyan-400/70 hover:bg-cyan-800/60 hover:text-white transition-colors"
+                                            >
+                                                <X className="size-3" />
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+
+                            {/* Hidden File Input */}
+                            <input
+                                ref={fileInputRef}
+                                type="file"
+                                multiple
+                                onChange={handleFileSelect}
+                                className="hidden"
+                                accept="image/*,.pdf,.txt,.md,.json,.csv,.js,.ts,.py,.php,.html,.css"
+                            />
+
                             <form
                                 onSubmit={(e) => void handleSubmit(e)}
-                                className="relative flex items-center rounded-2xl border border-cyan-500/40 bg-[#0f172a]/90 p-2 pl-4 shadow-xl shadow-cyan-950/50 focus-within:border-cyan-400 focus-within:ring-1 focus-within:ring-cyan-400/60 transition-all"
+                                className="relative flex items-center rounded-2xl border border-cyan-500/40 bg-[#0f172a]/90 p-2 pl-3 shadow-xl shadow-cyan-950/50 focus-within:border-cyan-400 focus-within:ring-1 focus-within:ring-cyan-400/60 transition-all"
                             >
+                                {/* Paperclip Attachment Trigger Button */}
+                                <button
+                                    type="button"
+                                    onClick={() => fileInputRef.current?.click()}
+                                    disabled={isLoading}
+                                    className="mr-2 flex size-8 shrink-0 items-center justify-center rounded-lg border border-cyan-800/60 bg-cyan-950/50 text-cyan-400 transition-all hover:bg-cyan-900/70 hover:text-cyan-200 hover:border-cyan-600 disabled:opacity-30 disabled:cursor-not-allowed"
+                                    title="Attach documents or images"
+                                >
+                                    <Paperclip className="size-4" />
+                                </button>
+
                                 <textarea
                                     ref={textareaRef}
                                     value={input}
@@ -632,7 +1026,7 @@ export default function Welcome() {
                                             void handleSubmit();
                                         }
                                     }}
-                                    placeholder="Enter command or query for AI Saathi... (Press Enter to transmit)"
+                                    placeholder={attachments.length > 0 ? "Add instructions for attached file(s)... (Press Enter to transmit)" : "Enter command or query for AI Saathi... (Press Enter to transmit)"}
                                     rows={1}
                                     className="max-h-32 flex-1 resize-none bg-transparent font-sans text-sm text-neutral-100 placeholder:text-neutral-500 focus:outline-none scrollbar-none"
                                     style={{ minHeight: '26px', height: 'auto' }}
@@ -640,7 +1034,7 @@ export default function Welcome() {
 
                                 <button
                                     type="submit"
-                                    disabled={!input.trim() || isLoading}
+                                    disabled={(!input.trim() && attachments.length === 0) || isLoading}
                                     className="ml-2 flex size-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 text-black font-bold shadow-md shadow-cyan-500/30 transition-all hover:brightness-110 disabled:opacity-30 disabled:cursor-not-allowed hover:scale-105 active:scale-95"
                                     title="Transmit to AI Saathi"
                                 >
@@ -653,7 +1047,7 @@ export default function Welcome() {
                                     <Terminal className="size-3 text-cyan-500" />
                                     <span>AI SAATHI NEURAL CO-PILOT</span>
                                 </span>
-                                <span>LATENCY: ~32ms // GEMINI 3.6 FLASH</span>
+                                <span>LATENCY: ~32ms // GEMINI 3.6 FLASH // MULTIMODAL ENABLED</span>
                             </div>
                         </div>
                     </div>
