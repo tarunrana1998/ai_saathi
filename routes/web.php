@@ -18,6 +18,11 @@ Route::match(['get', 'post'], '/prompt', function (Request $request) {
     return response()->json([
         'prompt' => $prompt,
         'response' => (string) $response,
+        'usage' => $response->usage?->toArray() ?? [
+            'prompt_tokens' => 0,
+            'completion_tokens' => 0,
+            'total_tokens' => 0,
+        ],
     ]);
 })->name('prompt');
 
@@ -43,6 +48,7 @@ Route::prefix('api')->group(function () {
                 'id' => $msg->id,
                 'role' => $msg->role,
                 'content' => $msg->content,
+                'usage' => $msg->usage,
                 'created_at' => $msg->created_at?->toISOString(),
             ]),
         ]);
@@ -71,6 +77,13 @@ Route::prefix('api')->group(function () {
 
         $conversation = Conversation::find($conversationId);
 
+        $usage = $response->usage ? [
+            'prompt_tokens' => $response->usage->promptTokens,
+            'completion_tokens' => $response->usage->completionTokens,
+            'total_tokens' => $response->usage->promptTokens + $response->usage->completionTokens,
+            'reasoning_tokens' => $response->usage->reasoningTokens,
+        ] : null;
+
         return response()->json([
             'conversation_id' => $conversationId,
             'title' => $conversation?->title,
@@ -78,8 +91,10 @@ Route::prefix('api')->group(function () {
                 'id' => (string) Str::uuid(),
                 'role' => 'assistant',
                 'content' => (string) $response,
+                'usage' => $usage,
                 'created_at' => now()->toISOString(),
             ],
+            'usage' => $usage,
         ]);
     });
 
